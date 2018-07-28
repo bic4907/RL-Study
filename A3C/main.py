@@ -6,11 +6,11 @@ import numpy as np
 
 # Env Settings
 ENV_NAME = 'CartPole-v0'
-THREAD_CNT = 1 #$mp.cpu_count()
+THREAD_CNT = 1 #mp.cpu_count()
 TRAIN_MODE = True
 RENDER = True
 MAX_EPISODE = 100
-UPDATE_INTERVAL = 4
+UPDATE_INTERVAL = 4 # n-step
 GAMMA = 0.99
 
 class Net(nn.Module):
@@ -35,12 +35,15 @@ class Net(nn.Module):
         )
 
     def get_action(self, s):
-        action_prob, _ = self.forward(s)
-
-        return np.random.choice(self.s_dim, p=action_prob.data.numpy())
+        action_prob, critic_val = self.forward(s)
+        return np.random.choice(self.s_dim, p=action_prob.data.numpy()), action_prob, critic_val
 
     def forward(self, s):
         return self.actor.forward(s), self.critic.forward(s)
+
+    def get_loss(self, a_prob_buffer, c_buffer, c_target_buffer):
+
+        pass
 
 class SharedOptimizer(torch.optim.RMSprop):
     def __init__(self, params):
@@ -65,30 +68,30 @@ class Worker(mp.Process):  # threads
 
             s = self.env.reset()
             l_step = 0
-            buffer_s, buffer_a, buffer_r = [], [], [] # buffer for n-Step
+            buffer_s, buffer_a, buffer_r, buffer_c = [], [], [], [] # buffer for n-Step
             episode_reward = 0
 
             while True: # env loop
 
-                a = self.l_net.get_action(np2torch(s))
+                a, a_prob, c = self.l_net.get_action(np2torch(s))
                 s_, r, done, _ = self.env.step(a)
 
                 if done:
                     r = -1
                 episode_reward += r
 
-                buffer_s.append(s)
-                buffer_a.append(a)
+                buffer_a_prob.append(a_prob)
                 buffer_r.append(r)
+                buffer_c.append(c) # get critic for advantage function
 
                 if RENDER == True and self.id == 0:
                     self.env.render()
 
                 # Update
                 if l_step % UPDATE_INTERVAL == 0 or done:
-                    self.update(buffer_s, buffer_a, buffer_r, s_, done)
+                    self.update(buffer_a_prob, buffer_r, buffer_c, s_, done)
 
-                    buffer_s, buffer_a, buffer_r = [], [], []
+                    buffer_a_prob, buffer_r, buffer_c = [], [], []
 
                     if done:
                         with self.g_epi.get_lock(): # Async task
@@ -99,31 +102,36 @@ class Worker(mp.Process):  # threads
                 else:
                     s = s_
 
-    def update(self, buffer_s, buffer_a, buffer_r, s_, done):
+    def push_and_pull(self, buffer_a_prob, buffer_r, buffer_c, s_, done):
+        if done: # critic for final
+            s__critic = 0.
+        else:
+            s__critic, _ = self.l_net.forward(s_)
 
-        buffer_s.reverse(), buffer_a.reverse(), buffer_r.reverse()
-        buffer_target_critic = []
+        # 1. Preprocessing
+        buffer_c_target = []
 
-        for s, a, r in zip(buffer_s, buffer_a, buffer_r):
-            buffer_target_critic.append(
-                r +
+        buffer_c_target.append(s__critic)
+        for r in buffer_r[::-1]:
+            buffer_c_target.append(
+                r + (GAMMA * buffer_c_target[-1])
             )
-            pass
+            buffer_c_target.reverse()
+        buffer_c_target.pop()
 
-        _, critic = self.l_net.forward(np2torch(s_))
+        # 2. Get gradient from local net
+        loss_actor, loss_critic = self.l_net.get_loss(buffer_a_prob, buffer_c, buffer_c_target)
 
+        # 3. Update global net with local gradient
+        self.g_opt.zero_grad()
+        loss_critic.backward()
+        loss_actor.backward()
+        for lp, gp in zip(self.l_net.parameters(), self.g_net.parameters()):
+            gp._grad = lp.grad
+        self.g_opt.step()
 
-
-
-
-
-
-
-
-
-
-
-        pass
+        # 4. Copy global net to local net
+        self.l_net.load_state_dict(self.g_net.state_dict())
 
 def np2torch(np_array, dtype=np.float32):
     if np_array.dtype != dtype:
