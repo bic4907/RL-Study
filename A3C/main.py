@@ -4,13 +4,17 @@ import torch.nn as nn
 import torch
 import numpy as np
 
+# I don't know
+#import os
+#os.environ["OMP_NUM_THREADS"] = "1"
+
 # Env Settings
 ENV_NAME = 'CartPole-v0'
-THREAD_CNT = 1 #mp.cpu_count()
+THREAD_CNT = 2 #mp.cpu_count()
 TRAIN_MODE = True
 RENDER = True
-MAX_EPISODE = 100
-UPDATE_INTERVAL = 4 # n-step
+MAX_EPISODE = 1000000000000
+UPDATE_INTERVAL = 10 # n-step
 GAMMA = 0.99
 
 class Net(nn.Module):
@@ -33,21 +37,62 @@ class Net(nn.Module):
             nn.ReLU(),
             nn.Linear(100, 1)
         )
+        self.distribution = torch.distributions.Categorical
 
     def get_action(self, s):
+        self.eval()
         action_prob, critic_val = self.forward(s)
         return np.random.choice(self.s_dim, p=action_prob.data.numpy()), action_prob, critic_val
+
 
     def forward(self, s):
         return self.actor.forward(s), self.critic.forward(s)
 
-    def get_loss(self, a_prob_buffer, c_buffer, c_target_buffer):
+    def get_loss(self, a_prob_buffer, c_buffer, c_target_buffer, buffer_a):
 
-        pass
+        self.train()
 
-class SharedOptimizer(torch.optim.RMSprop):
-    def __init__(self, params):
-        super(SharedOptimizer, self).__init__(params)
+        print(c_target_buffer)
+        c_target_buffer = torch.cat(c_target_buffer, dim=-1).detach() # [tensor(), tensor()] > tensor([, ])
+        c_buffer = torch.cat(c_buffer)
+        advantage = c_target_buffer - c_buffer
+
+
+        critic_loss = advantage.pow(2)
+
+        a_prob_buffer = torch.cat(a_prob_buffer)
+        actor_loss = -(a_prob_buffer * advantage.detach())
+
+        return actor_loss, critic_loss
+
+        """
+        self.train()
+        logits, values = self.forward(np2torch(np.array(buffer_s)))
+        td = c_target_buffer[0] - values[0]
+        c_loss = td.pow(2)
+        buffer_a = torch.from_numpy(np.array(buffer_a, np.float32))
+        m = self.distribution(logits)
+        exp_v = m.log_prob(buffer_a) * td.detach()
+        a_loss = -exp_v
+        
+        return a_loss, c_loss
+        """
+
+
+class SharedOptimizer(torch.optim.Adam):
+    def __init__(self, params, lr=1e-3, betas=(0.9, 0.9), eps=1e-8,
+                 weight_decay=0):
+        super(SharedOptimizer, self).__init__(params, lr=lr, eps=eps, weight_decay=weight_decay)
+        for group in self.param_groups:
+            for p in group['params']:
+                state = self.state[p]
+                state['step'] = 0
+                state['exp_avg'] = torch.zeros_like(p.data)
+                state['exp_avg_sq'] = torch.zeros_like(p.data)
+
+                # share in memory
+                state['exp_avg'].share_memory_()
+                state['exp_avg_sq'].share_memory_()
 
 
 class Worker(mp.Process):  # threads
@@ -62,36 +107,39 @@ class Worker(mp.Process):  # threads
         self.g_net, self.g_opt, self.g_epi = g_net, g_opt, g_epi
         self.l_net = Net(s_dim, a_dim)
 
+        self.l_net.load_state_dict(self.g_net.state_dict())
+
     def run(self):
 
         while self.g_epi.value < MAX_EPISODE: # episode loop
-
             s = self.env.reset()
             l_step = 0
-            buffer_s, buffer_a, buffer_r, buffer_c = [], [], [], [] # buffer for n-Step
+            buffer_a_prob, buffer_r, buffer_c, buffer_s, buffer_a = [], [], [], [], [] # buffer for n-Step
             episode_reward = 0
 
             while True: # env loop
-
                 a, a_prob, c = self.l_net.get_action(np2torch(s))
+
                 s_, r, done, _ = self.env.step(a)
+                l_step += 1
 
                 if done:
                     r = -1
                 episode_reward += r
-
-                buffer_a_prob.append(a_prob)
+                buffer_a_prob.append(a_prob[a].reshape(-1))
                 buffer_r.append(r)
-                buffer_c.append(c) # get critic for advantage function
+                buffer_c.append(c)
+                buffer_s.append(s) # get critic for advantage function
+                buffer_a.append(a) # get critic for advantage function
 
                 if RENDER == True and self.id == 0:
                     self.env.render()
 
                 # Update
                 if l_step % UPDATE_INTERVAL == 0 or done:
-                    self.update(buffer_a_prob, buffer_r, buffer_c, s_, done)
+                    self.push_and_pull(buffer_a_prob, buffer_r, buffer_c, s_, done, buffer_s, buffer_a)
 
-                    buffer_a_prob, buffer_r, buffer_c = [], [], []
+
 
                     if done:
                         with self.g_epi.get_lock(): # Async task
@@ -102,15 +150,15 @@ class Worker(mp.Process):  # threads
                 else:
                     s = s_
 
-    def push_and_pull(self, buffer_a_prob, buffer_r, buffer_c, s_, done):
+    def push_and_pull(self, buffer_a_prob, buffer_r, buffer_c, s_, done, buffer_s, buffer_a):
+
         if done: # critic for final
             s__critic = 0.
         else:
-            s__critic, _ = self.l_net.forward(s_)
+            _, s__critic = self.l_net.forward(np2torch(s_))
 
         # 1. Preprocessing
         buffer_c_target = []
-
         buffer_c_target.append(s__critic)
         for r in buffer_r[::-1]:
             buffer_c_target.append(
@@ -120,16 +168,17 @@ class Worker(mp.Process):  # threads
         buffer_c_target.pop()
 
         # 2. Get gradient from local net
-        loss_actor, loss_critic = self.l_net.get_loss(buffer_a_prob, buffer_c, buffer_c_target)
 
+        loss_actor, loss_critic = self.l_net.get_loss(buffer_a_prob, buffer_c, buffer_c_target, buffer_a)
+        return
         # 3. Update global net with local gradient
+
         self.g_opt.zero_grad()
         loss_critic.backward()
         loss_actor.backward()
         for lp, gp in zip(self.l_net.parameters(), self.g_net.parameters()):
-            gp._grad = lp.grad
+            gp._grad =lp .grad
         self.g_opt.step()
-
         # 4. Copy global net to local net
         self.l_net.load_state_dict(self.g_net.state_dict())
 
@@ -137,9 +186,6 @@ def np2torch(np_array, dtype=np.float32):
     if np_array.dtype != dtype:
         np_array = np_array.astype(dtype)
     return torch.from_numpy(np_array)
-
-
-
 
 if __name__ == '__main__':
     env = gym.make(ENV_NAME)
@@ -149,7 +195,7 @@ if __name__ == '__main__':
     global_net = Net(state_dim, action_dim)
     global_net.share_memory()
 
-    global_optimizer = SharedOptimizer(global_net.parameters())
+    global_optimizer = SharedOptimizer(global_net.parameters(), lr=0.0001)
 
     # Set Global Variables
     global_episode = mp.Value('i', 0)
