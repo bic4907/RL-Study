@@ -10,7 +10,7 @@ import numpy as np
 
 # Env Settings
 ENV_NAME = 'CartPole-v0'
-THREAD_CNT = 2 #mp.cpu_count()
+THREAD_CNT = mp.cpu_count()
 TRAIN_MODE = True
 RENDER = True
 MAX_EPISODE = 1000000000000
@@ -33,7 +33,6 @@ class Net(nn.Module):
         )
         self.critic = nn.Sequential(
             nn.Linear(s_dim, 100),
-
             nn.ReLU(),
             nn.Linear(100, 1)
         )
@@ -52,16 +51,17 @@ class Net(nn.Module):
 
         self.train()
 
-        print(c_target_buffer)
+        #print(c_target_buffer)
         c_target_buffer = torch.cat(c_target_buffer, dim=-1).detach() # [tensor(), tensor()] > tensor([, ])
         c_buffer = torch.cat(c_buffer)
         advantage = c_target_buffer - c_buffer
 
 
-        critic_loss = advantage.pow(2)
+        critic_loss = advantage.pow(2).mean()
 
         a_prob_buffer = torch.cat(a_prob_buffer)
-        actor_loss = -(a_prob_buffer * advantage.detach())
+        actor_loss = -(a_prob_buffer * advantage.detach()).mean()
+
 
         return actor_loss, critic_loss
 
@@ -119,8 +119,10 @@ class Worker(mp.Process):  # threads
 
             while True: # env loop
                 a, a_prob, c = self.l_net.get_action(np2torch(s))
+                #print(c)
 
                 s_, r, done, _ = self.env.step(a)
+                #print(done)
                 l_step += 1
 
                 if done:
@@ -154,6 +156,7 @@ class Worker(mp.Process):  # threads
 
         if done: # critic for final
             s__critic = 0.
+            return
         else:
             _, s__critic = self.l_net.forward(np2torch(s_))
 
@@ -170,12 +173,13 @@ class Worker(mp.Process):  # threads
         # 2. Get gradient from local net
 
         loss_actor, loss_critic = self.l_net.get_loss(buffer_a_prob, buffer_c, buffer_c_target, buffer_a)
-        return
+
         # 3. Update global net with local gradient
 
         self.g_opt.zero_grad()
-        loss_critic.backward()
-        loss_actor.backward()
+        (loss_critic + loss_actor).mean().backward(retain_graph=True)
+        #loss_critic.backward()
+        #loss_actor.backward()
         for lp, gp in zip(self.l_net.parameters(), self.g_net.parameters()):
             gp._grad =lp .grad
         self.g_opt.step()
