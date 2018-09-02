@@ -15,7 +15,7 @@ TRAIN_MODE = True
 RENDER = True
 MAX_EPISODE = 1000000000000
 UPDATE_INTERVAL = 10 # n-step
-GAMMA = 0.99
+GAMMA = 0.9
 
 class Net(nn.Module):
 
@@ -36,7 +36,6 @@ class Net(nn.Module):
             nn.ReLU(),
             nn.Linear(100, 1)
         )
-        self.distribution = torch.distributions.Categorical
 
     def get_action(self, s):
         self.eval()
@@ -47,37 +46,20 @@ class Net(nn.Module):
     def forward(self, s):
         return self.actor.forward(s), self.critic.forward(s)
 
-    def get_loss(self, a_prob_buffer, c_buffer, c_target_buffer, buffer_a):
-
+    def get_loss(self, a_prob_buffer, c_buffer, c_target_buffer):
         self.train()
 
-        #print(c_target_buffer)
-        c_target_buffer = torch.cat(c_target_buffer, dim=-1).detach() # [tensor(), tensor()] > tensor([, ])
-        c_buffer = torch.cat(c_buffer)
-        advantage = c_target_buffer - c_buffer
+        c_buffer = torch.cat(c_buffer, dim=0).reshape(1, -1)
+        c_target_buffer = np2torch(np.array(c_target_buffer))
 
+        advantage = c_target_buffer - c_buffer
 
         critic_loss = advantage.pow(2).mean()
 
         a_prob_buffer = torch.cat(a_prob_buffer)
         actor_loss = -(a_prob_buffer * advantage.detach()).mean()
 
-
         return actor_loss, critic_loss
-
-        """
-        self.train()
-        logits, values = self.forward(np2torch(np.array(buffer_s)))
-        td = c_target_buffer[0] - values[0]
-        c_loss = td.pow(2)
-        buffer_a = torch.from_numpy(np.array(buffer_a, np.float32))
-        m = self.distribution(logits)
-        exp_v = m.log_prob(buffer_a) * td.detach()
-        a_loss = -exp_v
-        
-        return a_loss, c_loss
-        """
-
 
 class SharedOptimizer(torch.optim.Adam):
     def __init__(self, params, lr=1e-3, betas=(0.9, 0.9), eps=1e-8,
@@ -99,7 +81,7 @@ class Worker(mp.Process):  # threads
     def __init__(self, g_net, g_opt, g_epi, s_dim, a_dim, id):
         super(Worker, self).__init__()
 
-        self.env = gym.make(ENV_NAME)
+        self.env = gym.make(ENV_NAME).unwrapped
         self.env.reset()
 
         self.id = id # worker number
@@ -119,8 +101,6 @@ class Worker(mp.Process):  # threads
 
             while True: # env loop
                 a, a_prob, c = self.l_net.get_action(np2torch(s))
-                #print(c)
-
                 s_, r, done, _ = self.env.step(a)
                 #print(done)
                 l_step += 1
@@ -140,7 +120,7 @@ class Worker(mp.Process):  # threads
                 # Update
                 if l_step % UPDATE_INTERVAL == 0 or done:
                     self.push_and_pull(buffer_a_prob, buffer_r, buffer_c, s_, done, buffer_s, buffer_a)
-
+                    buffer_a_prob, buffer_r, buffer_c, buffer_s, buffer_a = [], [], [], [], []
 
 
                     if done:
@@ -156,9 +136,10 @@ class Worker(mp.Process):  # threads
 
         if done: # critic for final
             s__critic = 0.
-            return
         else:
             _, s__critic = self.l_net.forward(np2torch(s_))
+            s__critic = s__critic.data.numpy()[0]
+
 
         # 1. Preprocessing
         buffer_c_target = []
@@ -167,29 +148,35 @@ class Worker(mp.Process):  # threads
             buffer_c_target.append(
                 r + (GAMMA * buffer_c_target[-1])
             )
-            buffer_c_target.reverse()
+        buffer_c_target.reverse()
         buffer_c_target.pop()
 
         # 2. Get gradient from local net
-
-        loss_actor, loss_critic = self.l_net.get_loss(buffer_a_prob, buffer_c, buffer_c_target, buffer_a)
+        actor_loss, critic_loss = self.l_net.get_loss(buffer_a_prob, buffer_c, buffer_c_target)
 
         # 3. Update global net with local gradient
 
         self.g_opt.zero_grad()
-        (loss_critic + loss_actor).mean().backward(retain_graph=True)
-        #loss_critic.backward()
-        #loss_actor.backward()
+        (critic_loss + actor_loss).backward()
         for lp, gp in zip(self.l_net.parameters(), self.g_net.parameters()):
             gp._grad =lp .grad
         self.g_opt.step()
         # 4. Copy global net to local net
         self.l_net.load_state_dict(self.g_net.state_dict())
 
+
 def np2torch(np_array, dtype=np.float32):
     if np_array.dtype != dtype:
         np_array = np_array.astype(dtype)
     return torch.from_numpy(np_array)
+
+
+def initialize(m):
+    if type(m) == nn.Linear:
+        m.weight.data.normal_(0.0, 0.02)
+        m.bias.data.fill_(0)
+
+
 
 if __name__ == '__main__':
     env = gym.make(ENV_NAME)
@@ -198,6 +185,9 @@ if __name__ == '__main__':
 
     global_net = Net(state_dim, action_dim)
     global_net.share_memory()
+
+    global_net.apply(initialize)
+
 
     global_optimizer = SharedOptimizer(global_net.parameters(), lr=0.0001)
 
