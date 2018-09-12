@@ -3,6 +3,8 @@ import multiprocessing as mp
 import torch.nn as nn
 import torch
 import numpy as np
+from tensorboardX import SummaryWriter
+import time
 
 # I don't know
 #import os
@@ -13,9 +15,10 @@ ENV_NAME = 'CartPole-v0'
 THREAD_CNT = mp.cpu_count()
 TRAIN_MODE = True
 RENDER = True
-MAX_EPISODE = 1000000000000
+MAX_EPISODE = 100000
 UPDATE_INTERVAL = 10 # n-step
 GAMMA = 0.9
+
 
 class Net(nn.Module):
 
@@ -24,6 +27,8 @@ class Net(nn.Module):
 
         self.s_dim = s_dim
         self.s_dim = a_dim
+
+        self.dist = torch.distributions.Categorical
 
         self.actor = nn.Sequential(
             nn.Linear(s_dim, 100),
@@ -40,8 +45,13 @@ class Net(nn.Module):
     def get_action(self, s):
         self.eval()
         action_prob, critic_val = self.forward(s)
-        return np.random.choice(self.s_dim, p=action_prob.data.numpy()), action_prob, critic_val
 
+        # dist = torch.distributions.Categorical(action_prob)
+        # print('action_probs :', action_prob)
+        # print('dist.probs :', dist.log_prob(torch.Tensor([0, 1])))
+        # print('dist.sample :', dist.sample())
+
+        return np.random.choice(self.s_dim, p=action_prob.data.numpy()), action_prob, critic_val
 
     def forward(self, s):
         return self.actor.forward(s), self.critic.forward(s)
@@ -56,13 +66,15 @@ class Net(nn.Module):
 
         critic_loss = advantage.pow(2).mean()
 
+
         a_prob_buffer = torch.cat(a_prob_buffer)
         actor_loss = -(a_prob_buffer * advantage.detach()).mean()
 
         return actor_loss, critic_loss
 
+
 class SharedOptimizer(torch.optim.Adam):
-    def __init__(self, params, lr=1e-3, betas=(0.9, 0.9), eps=1e-8,
+    def __init__(self, params, lr=1e-3, eps=1e-8,
                  weight_decay=0):
         super(SharedOptimizer, self).__init__(params, lr=lr, eps=eps, weight_decay=weight_decay)
         for group in self.param_groups:
@@ -78,7 +90,7 @@ class SharedOptimizer(torch.optim.Adam):
 
 
 class Worker(mp.Process):  # threads
-    def __init__(self, g_net, g_opt, g_epi, s_dim, a_dim, id):
+    def __init__(self, g_net, g_opt, g_epi, s_dim, a_dim, id, g_q):
         super(Worker, self).__init__()
 
         self.env = gym.make(ENV_NAME).unwrapped
@@ -86,10 +98,11 @@ class Worker(mp.Process):  # threads
 
         self.id = id # worker number
 
-        self.g_net, self.g_opt, self.g_epi = g_net, g_opt, g_epi
+        self.g_net, self.g_opt, self.g_epi, self.g_q = g_net, g_opt, g_epi, g_q
         self.l_net = Net(s_dim, a_dim)
 
         self.l_net.load_state_dict(self.g_net.state_dict())
+
 
     def run(self):
 
@@ -108,7 +121,12 @@ class Worker(mp.Process):  # threads
                 if done:
                     r = -1
                 episode_reward += r
-                buffer_a_prob.append(a_prob[a].reshape(-1))
+
+                m = torch.distributions.Categorical(a_prob)
+                a_prob = m.log_prob(torch.Tensor([a]))
+
+
+                buffer_a_prob.append(a_prob)
                 buffer_r.append(r)
                 buffer_c.append(c)
                 buffer_s.append(s) # get critic for advantage function
@@ -122,12 +140,12 @@ class Worker(mp.Process):  # threads
                     self.push_and_pull(buffer_a_prob, buffer_r, buffer_c, s_, done, buffer_s, buffer_a)
                     buffer_a_prob, buffer_r, buffer_c, buffer_s, buffer_a = [], [], [], [], []
 
-
                     if done:
                         with self.g_epi.get_lock(): # Async task
                             self.g_epi.value += 1
 
-                        print('Worker {} | Episode : {} | Episode_Reward : {}'.format(self.id, self.g_epi.value, episode_reward))
+                        self.g_q.put([self.g_epi.value, episode_reward])
+                        #print('Worker {} | Episode : {} | Episode_Reward : {}'.format(self.id, self.g_epi.value, episode_reward))
                         break
                 else:
                     s = s_
@@ -187,12 +205,19 @@ if __name__ == '__main__':
     global_net.share_memory()
 
     global_net.apply(initialize)
-
-
     global_optimizer = SharedOptimizer(global_net.parameters(), lr=0.0001)
 
     # Set Global Variables
     global_episode = mp.Value('i', 0)
+    global_queue = mp.Queue()
 
-    workers = [Worker(global_net, global_optimizer, global_episode, state_dim, action_dim, i) for i in range(THREAD_CNT)]
+    workers = [Worker(global_net, global_optimizer, global_episode, state_dim, action_dim, i, global_queue) for i in range(THREAD_CNT)]
     [w.start() for w in workers]
+
+
+    writer = SummaryWriter()
+    while True:
+        while not global_queue.empty():
+            e = global_queue.get()
+            writer.add_scalar('data/reward', e[1], e[0])
+
