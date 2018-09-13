@@ -16,7 +16,7 @@ register(
 # Env Settings
 ENV_NAME = 'CartPole-v5'
 TRAIN_MODE = True
-RENDER = False
+RENDER = True
 MAX_EPISODE = 1000000000
 MEMORY_SIZE = 2000
 UPDATE_INTERVAL = 100 # copy interval main to target
@@ -24,31 +24,35 @@ GAMMA = 0.9
 EPSILON = 0.9
 LEARNING_RATE = 0.01
 
-class Net(nn.Module):
-
+class Dueling_Net(nn.Module):
     def __init__(self, s_dim, a_dim):
-        super(Net, self).__init__()
+        super(Dueling_Net, self).__init__()
 
         self.s_dim = s_dim
         self.a_dim = a_dim
 
-        self.net = nn.Sequential(
+        self.v_net = nn.Sequential(
+            nn.Linear(s_dim, 100),
+            nn.ReLU(),
+            nn.Linear(100, 1)
+        )
+        self.a_net = nn.Sequential(
             nn.Linear(s_dim, 100),
             nn.ReLU(),
             nn.Linear(100, a_dim)
         )
 
     def get_action(self, s):
-        if np.random.uniform() > EPSILON or global_step < MEMORY_SIZE:  # Exploration
-            action = np.random.randint(0, self.a_dim)
-        else:
-            q_value = self.forward(np2torch(s))
-            action = torch.argmax(q_value).detach().numpy()
+        q_value = self.forward(np2torch(s))
+        action = torch.argmax(q_value).detach().numpy()
         return action
 
     def forward(self, s):
-        return self.net.forward(s)
+        v = self.v_net.forward(s)
+        a = self.a_net.forward(s)
 
+        q = v + (a - torch.mean(a))
+        return q
 
 def get_loss(memory, main_net, target_net):
 
@@ -59,16 +63,15 @@ def get_loss(memory, main_net, target_net):
     batch_s_ = torch.Tensor(memory[:, state_dim + 2 : -1])
     batch_done = torch.Tensor(memory[:, -1])
 
-    real_choice = torch.argmax(main_net.forward(batch_s_), dim=-1, keepdim=True)
 
-    q_next = target_net.forward(batch_s_).gather(1, real_choice).detach()
-
+    q_next = target_net.forward(batch_s_).max(dim=-1)[0].detach().reshape(-1, 1)
     for i in range(len(batch_done)):
        if batch_done[i]:
            q_next[i] = 0
+
     target = (batch_r + GAMMA * q_next)
     main = main_net.forward(batch_s).gather(1, batch_a)
-
+    #print(main.shape)
     return torch.nn.MSELoss()(main, target)
 
 
@@ -89,8 +92,10 @@ if __name__ == '__main__':
 
     writer = SummaryWriter()
 
-    main_net = Net(state_dim, action_dim)
-    target_net = Net(state_dim, action_dim)
+    # Networks for Dueling Network
+    main_net = Dueling_Net(state_dim, action_dim)
+    target_net = Dueling_Net(state_dim, action_dim)
+
     optimizer = torch.optim.Adam(main_net.parameters(), lr=LEARNING_RATE)
 
     initialize(main_net)
@@ -132,12 +137,11 @@ if __name__ == '__main__':
                 optimizer.step()
 
             if global_step % UPDATE_INTERVAL == 0:
-                target_net.load_state_dict(main_net.state_dict())
-
+                target_net.v_net.load_state_dict(main_net.v_net.state_dict())
+                target_net.a_net.load_state_dict(main_net.a_net.state_dict())
             global_step += 1
 
             s = s_
-
             if done:
                 break
         global_episode += 1

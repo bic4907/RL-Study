@@ -93,7 +93,7 @@ if __name__ == '__main__':
     state_dim = env.observation_space.shape[0]
     action_dim = env.action_space.n
 
-    writer = SummaryWriter()
+    #writer = SummaryWriter()
 
     main_net = Net(state_dim, action_dim)
     target_net = Net(state_dim, action_dim)
@@ -149,7 +149,7 @@ if __name__ == '__main__':
                 break
         global_episode += 1
 
-        writer.add_scalar('data/reward', epi_reward, global_step)
+        #writer.add_scalar('data/reward', epi_reward, global_step)
         if(global_episode % 10 == 0):
             print("%05d\t%07d\t%5.0f" % (global_step, global_episode, epi_reward))
 
